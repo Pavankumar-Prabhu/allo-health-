@@ -20,7 +20,7 @@ Next.js app for multi-warehouse inventory with **race-safe checkout reservations
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/Pavan-TDAI/all0-health.git
+git clone https://github.com/Pavankumar-Prabhu/allo-health-.git
 cd allo-health
 npm install
 ```
