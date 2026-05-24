@@ -33,16 +33,27 @@ Copy the example file and fill in your hosted Postgres credentials:
 cp .env.example .env.local
 ```
 
+**Important:** Prisma CLI does not read `.env.local` by itself. Use the npm scripts (`npm run db:migrate`, `npm run db:seed`) which load `.env.local` automatically. Or duplicate the file: `copy .env.local .env` on Windows.
+
+### Where to find Supabase connection strings
+
+1. Open your project at [supabase.com/dashboard](https://supabase.com/dashboard).
+2. **Project Settings** (gear icon) → **Database**.
+3. Under **Connection string**, choose **URI**:
+   - **Transaction pooler** → port `6543` → paste as `DATABASE_URL` (add `?pgbouncer=true` at the end).
+   - **Direct connection** → host `db.xxxxx.supabase.co` port `5432` → paste as `DIRECT_URL`.
+4. Replace `[YOUR-PASSWORD]` with your database password (URL-encode `@` as `%40`).
+
 | Variable | Purpose |
 |----------|---------|
 | `DATABASE_URL` | Pooled Postgres URL (Supabase transaction pooler, port **6543**) |
-| `DIRECT_URL` | Direct Postgres URL for migrations (port **5432**) |
+| `DIRECT_URL` | Direct Postgres URL for migrations (`db.[ref].supabase.co:5432`) |
 | `CRON_SECRET` | Bearer token for `/api/cron/expire-reservations` |
 
 ### 3. Migrate and seed
 
 ```bash
-npx prisma migrate deploy
+npm run db:migrate
 npm run db:seed
 ```
 
