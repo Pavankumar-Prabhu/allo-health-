@@ -41,16 +41,31 @@ cp .env.example .env.local
 2. **Project Settings** (gear icon) → **Database**.
 3. Under **Connection string**, choose **URI**:
    - **Transaction pooler** → port `6543` → paste as `DATABASE_URL` (add `?pgbouncer=true` at the end).
-   - **Direct connection** → host `db.xxxxx.supabase.co` port `5432` → paste as `DIRECT_URL`.
+   - **Session pooler** → port `5432` on `aws-0-….pooler.supabase.com` → paste as `DIRECT_URL` (required on Windows / IPv4 networks).
+   - **Direct connection** (`db.xxxxx.supabase.co`) is IPv6-only — if you see “Not IPv4 compatible” in Supabase, do **not** use it for `DIRECT_URL`; use Session pooler instead.
 4. Replace `[YOUR-PASSWORD]` with your database password (URL-encode `@` as `%40`).
+
+> **Note:** A Supabase access token (`sbp_…`) is for the Management API, not database connections. Prisma only needs `DATABASE_URL` and `DIRECT_URL`.
 
 | Variable | Purpose |
 |----------|---------|
 | `DATABASE_URL` | Pooled Postgres URL (Supabase transaction pooler, port **6543**) |
-| `DIRECT_URL` | Direct Postgres URL for migrations (`db.[ref].supabase.co:5432`) |
+| `DIRECT_URL` | Session pooler URL for migrations (port **5432**, same pooler host) |
 | `CRON_SECRET` | Bearer token for `/api/cron/expire-reservations` |
 
-### 3. Migrate and seed
+### 3. Create tables
+
+**If `npm run db:migrate` fails with P1001** (common on Windows when port 5432 is blocked):
+
+1. Open **Supabase → SQL Editor → New query**
+2. Paste and run the file `scripts/supabase-manual-setup.sql`
+3. Then seed:
+
+```bash
+npm run db:seed
+```
+
+**If migrate works on your network:**
 
 ```bash
 npm run db:migrate

@@ -1,5 +1,15 @@
 import type { Product, Reservation } from "@/types/api";
 
+async function parseJsonResponse(res: Response) {
+  const text = await res.text();
+  if (!text) return {};
+  try {
+    return JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    return { error: "Invalid server response" };
+  }
+}
+
 function idempotencyKey(prefix: string) {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
     return `${prefix}-${crypto.randomUUID()}`;
@@ -10,8 +20,8 @@ function idempotencyKey(prefix: string) {
 export async function fetchProducts(): Promise<Product[]> {
   const res = await fetch("/api/products", { cache: "no-store" });
   if (!res.ok) throw new Error("Failed to load products");
-  const data = await res.json();
-  return data.products;
+  const data = await parseJsonResponse(res);
+  return data.products as Product[];
 }
 
 export async function reserveStock(input: {
@@ -28,11 +38,14 @@ export async function reserveStock(input: {
     body: JSON.stringify(input),
   });
 
-  const data = await res.json();
+  const data = await parseJsonResponse(res);
   if (!res.ok) {
-    return { status: res.status, error: data.error ?? "Request failed" };
+    return {
+      status: res.status,
+      error: String(data.error ?? "Request failed"),
+    };
   }
-  return { status: res.status, reservation: data.reservation };
+  return { status: res.status, reservation: data.reservation as Reservation };
 }
 
 export async function fetchReservation(
@@ -41,8 +54,8 @@ export async function fetchReservation(
   const res = await fetch(`/api/reservations/${id}`, { cache: "no-store" });
   if (res.status === 404) return null;
   if (!res.ok) throw new Error("Failed to load reservation");
-  const data = await res.json();
-  return data.reservation;
+  const data = await parseJsonResponse(res);
+  return data.reservation as Reservation;
 }
 
 export async function confirmReservation(
@@ -52,11 +65,14 @@ export async function confirmReservation(
     method: "POST",
     headers: { "Idempotency-Key": idempotencyKey("confirm") },
   });
-  const data = await res.json();
+  const data = await parseJsonResponse(res);
   if (!res.ok) {
-    return { status: res.status, error: data.error ?? "Confirm failed" };
+    return {
+      status: res.status,
+      error: String(data.error ?? "Confirm failed"),
+    };
   }
-  return { status: res.status, reservation: data.reservation };
+  return { status: res.status, reservation: data.reservation as Reservation };
 }
 
 export async function releaseReservation(
@@ -65,9 +81,12 @@ export async function releaseReservation(
   const res = await fetch(`/api/reservations/${id}/release`, {
     method: "POST",
   });
-  const data = await res.json();
+  const data = await parseJsonResponse(res);
   if (!res.ok) {
-    return { status: res.status, error: data.error ?? "Release failed" };
+    return {
+      status: res.status,
+      error: String(data.error ?? "Release failed"),
+    };
   }
-  return { status: res.status, reservation: data.reservation };
+  return { status: res.status, reservation: data.reservation as Reservation };
 }

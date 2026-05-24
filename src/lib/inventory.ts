@@ -1,4 +1,4 @@
-import { ReservationStatus } from "@prisma/client";
+import { Prisma, ReservationStatus } from "@prisma/client";
 import { prisma } from "@/lib/db";
 import { RESERVATION_TTL_MS } from "@/lib/constants";
 import type { ReserveInput } from "@/lib/validations";
@@ -16,6 +16,11 @@ export type ReservationDto = {
   product?: { id: string; name: string; sku: string; priceCents: number };
   warehouse?: { id: string; name: string; code: string };
 };
+
+const reservationInclude = {
+  product: { select: { id: true, name: true, sku: true, priceCents: true } },
+  warehouse: { select: { id: true, name: true, code: true } },
+} as const;
 
 function toDto(
   reservation: {
@@ -47,22 +52,43 @@ function toDto(
   };
 }
 
-export async function expireStaleReservations(): Promise<number> {
-  const now = new Date();
-  const stale = await prisma.reservation.findMany({
-    where: {
-      status: ReservationStatus.PENDING,
-      expiresAt: { lt: now },
-    },
-    take: 200,
+async function loadReservation(id: string) {
+  return prisma.reservation.findUnique({
+    where: { id },
+    include: reservationInclude,
   });
+}
 
-  let released = 0;
-  for (const reservation of stale) {
-    const ok = await releaseReservation(reservation.id, { reason: "expired" });
-    if (ok.ok) released += 1;
-  }
-  return released;
+/** Bulk expire — single SQL, no interactive transaction (PgBouncer-safe). */
+export async function expireStaleReservations(): Promise<number> {
+  const result = await prisma.$executeRaw`
+    WITH expired AS (
+      SELECT id, "productId", "warehouseId", quantity
+      FROM reservations
+      WHERE status = 'PENDING'::"ReservationStatus"
+        AND "expiresAt" < NOW()
+      LIMIT 200
+    ),
+    stock AS (
+      UPDATE stock_levels sl
+      SET "reservedUnits" = sl."reservedUnits" - e.quantity
+      FROM expired e
+      WHERE sl."productId" = e."productId"
+        AND sl."warehouseId" = e."warehouseId"
+        AND sl."reservedUnits" >= e.quantity
+    ),
+    released AS (
+      UPDATE reservations r
+      SET
+        status = 'RELEASED'::"ReservationStatus",
+        "releasedAt" = NOW(),
+        "updatedAt" = NOW()
+      FROM expired e
+      WHERE r.id = e.id
+    )
+    SELECT 1
+  `;
+  return typeof result === "number" ? result : 0;
 }
 
 export async function createReservation(
@@ -82,7 +108,6 @@ export async function createReservation(
         warehouseId: input.warehouseId,
       },
     },
-    include: { product: true, warehouse: true },
   });
 
   if (!stock) {
@@ -91,56 +116,52 @@ export async function createReservation(
 
   const expiresAt = new Date(Date.now() + RESERVATION_TTL_MS);
 
+  const updated = await prisma.$executeRaw`
+    UPDATE stock_levels
+    SET "reservedUnits" = "reservedUnits" + ${input.quantity}
+    WHERE "productId" = ${input.productId}
+      AND "warehouseId" = ${input.warehouseId}
+      AND "totalUnits" - "reservedUnits" >= ${input.quantity}
+  `;
+
+  if (updated === 0) {
+    return {
+      ok: false,
+      status: 409,
+      message: "Not enough stock available to reserve",
+    };
+  }
+
   try {
-    const reservation = await prisma.$transaction(async (tx) => {
-      const updated = await tx.$executeRaw`
-        UPDATE stock_levels
-        SET "reservedUnits" = "reservedUnits" + ${input.quantity}
-        WHERE "productId" = ${input.productId}
-          AND "warehouseId" = ${input.warehouseId}
-          AND "totalUnits" - "reservedUnits" >= ${input.quantity}
-      `;
-
-      if (updated === 0) {
-        throw new Error("INSUFFICIENT_STOCK");
-      }
-
-      return tx.reservation.create({
-        data: {
-          productId: input.productId,
-          warehouseId: input.warehouseId,
-          quantity: input.quantity,
-          expiresAt,
-          idempotencyKey: idempotencyKey ?? undefined,
-        },
-        include: {
-          product: { select: { id: true, name: true, sku: true, priceCents: true } },
-          warehouse: { select: { id: true, name: true, code: true } },
-        },
-      });
+    const reservation = await prisma.reservation.create({
+      data: {
+        productId: input.productId,
+        warehouseId: input.warehouseId,
+        quantity: input.quantity,
+        expiresAt,
+        idempotencyKey: idempotencyKey ?? undefined,
+      },
+      include: reservationInclude,
     });
 
     return { ok: true, reservation: toDto(reservation) };
   } catch (error) {
-    if (error instanceof Error && error.message === "INSUFFICIENT_STOCK") {
-      return {
-        ok: false,
-        status: 409,
-        message: "Not enough stock available to reserve",
-      };
-    }
+    await prisma.$executeRaw`
+      UPDATE stock_levels
+      SET "reservedUnits" = "reservedUnits" - ${input.quantity}
+      WHERE "productId" = ${input.productId}
+        AND "warehouseId" = ${input.warehouseId}
+        AND "reservedUnits" >= ${input.quantity}
+    `;
+
     if (
-      error &&
-      typeof error === "object" &&
-      "code" in error &&
-      (error as { code: string }).code === "P2002"
+      error instanceof Prisma.PrismaClientKnownRequestError &&
+      error.code === "P2002" &&
+      idempotencyKey
     ) {
       const existing = await prisma.reservation.findUnique({
-        where: { idempotencyKey: idempotencyKey! },
-        include: {
-          product: { select: { id: true, name: true, sku: true, priceCents: true } },
-          warehouse: { select: { id: true, name: true, code: true } },
-        },
+        where: { idempotencyKey },
+        include: reservationInclude,
       });
       if (existing) {
         return { ok: true, reservation: toDto(existing) };
@@ -151,16 +172,7 @@ export async function createReservation(
 }
 
 export async function getReservation(id: string): Promise<ReservationDto | null> {
-  await expireStaleReservations();
-
-  const reservation = await prisma.reservation.findUnique({
-    where: { id },
-    include: {
-      product: { select: { id: true, name: true, sku: true, priceCents: true } },
-      warehouse: { select: { id: true, name: true, code: true } },
-    },
-  });
-
+  const reservation = await loadReservation(id);
   return reservation ? toDto(reservation) : null;
 }
 
@@ -172,180 +184,140 @@ export async function confirmReservation(
   | { ok: false; status: 409; message: string }
   | { ok: false; status: 410; message: string }
 > {
-  await expireStaleReservations();
+  const existing = await loadReservation(id);
+  if (!existing) {
+    return { ok: false, status: 404, message: "Reservation not found" };
+  }
 
-  try {
-    const reservation = await prisma.$transaction(async (tx) => {
-      const rows = await tx.$queryRaw<
-        Array<{
-          id: string;
-          productId: string;
-          warehouseId: string;
-          quantity: number;
-          status: ReservationStatus;
-          expiresAt: Date;
-        }>
-      >`
-        SELECT id, "productId", "warehouseId", quantity, status, "expiresAt"
-        FROM reservations
-        WHERE id = ${id}
-        FOR UPDATE
-      `;
+  if (existing.status === ReservationStatus.CONFIRMED) {
+    return { ok: true, reservation: toDto(existing) };
+  }
 
-      const row = rows[0];
-      if (!row) return null;
+  if (existing.status !== ReservationStatus.PENDING) {
+    return {
+      ok: false,
+      status: 409,
+      message: "Reservation is no longer pending",
+    };
+  }
 
-      if (row.status === ReservationStatus.CONFIRMED) {
-        const full = await tx.reservation.findUnique({
-          where: { id },
-          include: {
-            product: { select: { id: true, name: true, sku: true, priceCents: true } },
-            warehouse: { select: { id: true, name: true, code: true } },
-          },
-        });
-        return full;
-      }
+  if (existing.expiresAt < new Date()) {
+    await releaseReservation(id, { reason: "expired" });
+    return {
+      ok: false,
+      status: 410,
+      message: "Reservation has expired and was released",
+    };
+  }
 
-      if (row.status !== ReservationStatus.PENDING) {
-        throw new Error("NOT_PENDING");
-      }
+  const confirmed = await prisma.$queryRaw<
+    Array<{ id: string }>
+  >`
+    WITH updated_res AS (
+      UPDATE reservations
+      SET
+        status = 'CONFIRMED'::"ReservationStatus",
+        "confirmedAt" = NOW(),
+        "updatedAt" = NOW()
+      WHERE id = ${id}
+        AND status = 'PENDING'::"ReservationStatus"
+        AND "expiresAt" > NOW()
+      RETURNING id, "productId", "warehouseId", quantity
+    ),
+    updated_stock AS (
+      UPDATE stock_levels sl
+      SET
+        "reservedUnits" = sl."reservedUnits" - ur.quantity,
+        "totalUnits" = sl."totalUnits" - ur.quantity
+      FROM updated_res ur
+      WHERE sl."productId" = ur."productId"
+        AND sl."warehouseId" = ur."warehouseId"
+        AND sl."reservedUnits" >= ur.quantity
+        AND sl."totalUnits" >= ur.quantity
+      RETURNING sl.id
+    )
+    SELECT ur.id FROM updated_res ur
+    INNER JOIN updated_stock us ON TRUE
+  `;
 
-      if (row.expiresAt < new Date()) {
-        throw new Error("EXPIRED");
-      }
-
-      await tx.$executeRaw`
-        UPDATE stock_levels
-        SET
-          "reservedUnits" = "reservedUnits" - ${row.quantity},
-          "totalUnits" = "totalUnits" - ${row.quantity}
-        WHERE "productId" = ${row.productId}
-          AND "warehouseId" = ${row.warehouseId}
-          AND "reservedUnits" >= ${row.quantity}
-          AND "totalUnits" >= ${row.quantity}
-      `;
-
-      return tx.reservation.update({
-        where: { id },
-        data: {
-          status: ReservationStatus.CONFIRMED,
-          confirmedAt: new Date(),
-        },
-        include: {
-          product: { select: { id: true, name: true, sku: true, priceCents: true } },
-          warehouse: { select: { id: true, name: true, code: true } },
-        },
-      });
-    });
-
-    if (!reservation) {
+  if (confirmed.length === 0) {
+    const current = await loadReservation(id);
+    if (!current) {
       return { ok: false, status: 404, message: "Reservation not found" };
     }
-
-    return { ok: true, reservation: toDto(reservation) };
-  } catch (error) {
-    if (error instanceof Error) {
-      if (error.message === "EXPIRED") {
-        await releaseReservation(id, { reason: "expired" });
-        return {
-          ok: false,
-          status: 410,
-          message: "Reservation has expired and was released",
-        };
-      }
-      if (error.message === "NOT_PENDING") {
-        return {
-          ok: false,
-          status: 409,
-          message: "Reservation is no longer pending",
-        };
-      }
+    if (current.expiresAt < new Date()) {
+      await releaseReservation(id, { reason: "expired" });
+      return {
+        ok: false,
+        status: 410,
+        message: "Reservation has expired and was released",
+      };
     }
-    throw error;
+    return {
+      ok: false,
+      status: 409,
+      message: "Could not confirm reservation — stock conflict",
+    };
   }
+
+  const reservation = await loadReservation(id);
+  if (!reservation) {
+    return { ok: false, status: 404, message: "Reservation not found" };
+  }
+
+  return { ok: true, reservation: toDto(reservation) };
 }
 
 export async function releaseReservation(
   id: string,
-  options?: { reason?: "cancelled" | "expired" }
+  _options?: { reason?: "cancelled" | "expired" }
 ): Promise<
   | { ok: true; reservation: ReservationDto }
   | { ok: false; status: 404; message: string }
   | { ok: false; status: 409; message: string }
 > {
-  try {
-    const reservation = await prisma.$transaction(async (tx) => {
-      const rows = await tx.$queryRaw<
-        Array<{
-          id: string;
-          productId: string;
-          warehouseId: string;
-          quantity: number;
-          status: ReservationStatus;
-        }>
-      >`
-        SELECT id, "productId", "warehouseId", quantity, status
-        FROM reservations
-        WHERE id = ${id}
-        FOR UPDATE
-      `;
-
-      const row = rows[0];
-      if (!row) return null;
-
-      if (row.status === ReservationStatus.RELEASED) {
-        const full = await tx.reservation.findUnique({
-          where: { id },
-          include: {
-            product: { select: { id: true, name: true, sku: true, priceCents: true } },
-            warehouse: { select: { id: true, name: true, code: true } },
-          },
-        });
-        return full;
-      }
-
-      if (row.status === ReservationStatus.CONFIRMED) {
-        throw new Error("ALREADY_CONFIRMED");
-      }
-
-      if (row.status === ReservationStatus.PENDING) {
-        await tx.$executeRaw`
-          UPDATE stock_levels
-          SET "reservedUnits" = "reservedUnits" - ${row.quantity}
-          WHERE "productId" = ${row.productId}
-            AND "warehouseId" = ${row.warehouseId}
-            AND "reservedUnits" >= ${row.quantity}
-        `;
-      }
-
-      return tx.reservation.update({
-        where: { id },
-        data: {
-          status: ReservationStatus.RELEASED,
-          releasedAt: new Date(),
-        },
-        include: {
-          product: { select: { id: true, name: true, sku: true, priceCents: true } },
-          warehouse: { select: { id: true, name: true, code: true } },
-        },
-      });
-    });
-
-    if (!reservation) {
-      return { ok: false, status: 404, message: "Reservation not found" };
-    }
-
-    return { ok: true, reservation: toDto(reservation) };
-  } catch (error) {
-    if (error instanceof Error && error.message === "ALREADY_CONFIRMED") {
-      return {
-        ok: false,
-        status: 409,
-        message: "Cannot release a confirmed reservation",
-      };
-    }
-    throw error;
+  const existing = await loadReservation(id);
+  if (!existing) {
+    return { ok: false, status: 404, message: "Reservation not found" };
   }
+
+  if (existing.status === ReservationStatus.RELEASED) {
+    return { ok: true, reservation: toDto(existing) };
+  }
+
+  if (existing.status === ReservationStatus.CONFIRMED) {
+    return {
+      ok: false,
+      status: 409,
+      message: "Cannot release a confirmed reservation",
+    };
+  }
+
+  await prisma.$executeRaw`
+    WITH updated_res AS (
+      UPDATE reservations
+      SET
+        status = 'RELEASED'::"ReservationStatus",
+        "releasedAt" = NOW(),
+        "updatedAt" = NOW()
+      WHERE id = ${id}
+        AND status = 'PENDING'::"ReservationStatus"
+      RETURNING "productId", "warehouseId", quantity
+    )
+    UPDATE stock_levels sl
+    SET "reservedUnits" = sl."reservedUnits" - ur.quantity
+    FROM updated_res ur
+    WHERE sl."productId" = ur."productId"
+      AND sl."warehouseId" = ur."warehouseId"
+      AND sl."reservedUnits" >= ur.quantity
+  `;
+
+  const reservation = await loadReservation(id);
+  if (!reservation) {
+    return { ok: false, status: 404, message: "Reservation not found" };
+  }
+
+  return { ok: true, reservation: toDto(reservation) };
 }
 
 export async function listProductsWithStock() {
